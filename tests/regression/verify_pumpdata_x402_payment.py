@@ -27,8 +27,10 @@ that holds nothing. No network, nothing signed for the chain, no funds moved:
      fee payer, or naming the payer as fee payer are refused before signing.
   5. A 404 costs nothing; an unpaid 402 is counted as what it would cost.
   6. A paid call whose reply is not JSON still returns its receipt; an offer
-     refused before signing is skipped by `ask`, not raised.
-  7. The first signers come back oldest first, failed transactions skipped,
+     refused before signing is skipped by `ask`, not raised; an unreadable
+     receipt after paying is a paid answer, not a refusal.
+  7. An offer carried only in the PAYMENT-REQUIRED header is read and paid.
+  8. The first signers come back oldest first, failed transactions skipped,
      each wallet once, the create's signer first; a curve with more history
      than the script pages through gives none.
 
@@ -308,7 +310,7 @@ async def check_bad_offers_refused_before_signing() -> bool:
         try:
             await call(session, payer=payer)
             failures.append(f"{name}: paid")
-        except ValueError:
+        except check.OfferRefusedError:
             if session.signatures:
                 failures.append(f"{name}: signed before refusing")
     return report(
@@ -345,12 +347,59 @@ async def check_bad_replies_do_not_lose_the_payment() -> bool:
     session = StubSession(paid_once(offer(amount="20000")))
     calls = {"payer": Keypair(), "rpc_endpoint": RPC, "max_usd": 0.01}
     skipped = await check.ask(session, API, "GET", "GET", PATH, body=None, calls=calls)
-    ok = kept and skipped is None and not session.signatures
-    return report(
-        "non-JSON reply keeps the receipt; refused offer skipped",
-        ok,
-        f"{answer} {skipped}",
+    garbled = await check.ask(
+        StubSession(garbled_receipt(offer())),
+        API,
+        "GET",
+        "GET",
+        PATH,
+        body=None,
+        calls=calls | {"max_usd": 0.01},
     )
+    paid_anyway = (
+        garbled is not None
+        and garbled.status == HTTPStatus.OK
+        and check.cost(garbled, paying=True) == PRICE_USD
+    )
+    ok = kept and skipped is None and not session.signatures and paid_anyway
+    return report(
+        "non-JSON reply keeps the receipt; refused offer skipped; bad receipt paid",
+        ok,
+        f"{answer} {skipped} {garbled}",
+    )
+
+
+def garbled_receipt(accepted: dict) -> Callable[[dict], StubResponse]:
+    """402 until a payment arrives, then 200 with a receipt that is not JSON."""
+
+    def answer(headers: dict) -> StubResponse:
+        if "PAYMENT-SIGNATURE" not in headers:
+            return StubResponse(402, payment_required(accepted))
+        return StubResponse(200, {"ok": True}, {"PAYMENT-RESPONSE": "bm90IGpzb24="})
+
+    return answer
+
+
+async def check_offer_read_from_header() -> bool:
+    """A 402 with the offer only in PAYMENT-REQUIRED (empty body) is paid."""
+    paid = paid_once(offer())
+    challenge = base64.b64encode(
+        json.dumps(payment_required(offer())).encode()
+    ).decode()
+
+    def header_only(headers: dict) -> StubResponse:
+        if "PAYMENT-SIGNATURE" not in headers:
+            return StubResponse(402, {}, {"PAYMENT-REQUIRED": challenge})
+        return paid(headers)
+
+    session = StubSession(header_only)
+    answer = await call(session, payer=Keypair())
+    ok = (
+        answer.status == HTTPStatus.OK
+        and answer.receipt == RECEIPT
+        and len(session.signatures) == 1
+    )
+    return report("offer read from the PAYMENT-REQUIRED header", ok, str(answer))
 
 
 async def check_first_signers_oldest_first() -> bool:
@@ -407,6 +456,7 @@ async def main() -> None:
         await check_bad_offers_refused_before_signing(),
         await check_costs(),
         await check_bad_replies_do_not_lose_the_payment(),
+        await check_offer_read_from_header(),
         await check_first_signers_oldest_first(),
     ]
 

@@ -114,11 +114,29 @@ class Answer:
     receipt: str | None = None
 
 
+class OfferRefusedError(Exception):
+    """A 402 offer this script will not pay. Raised before anything is signed."""
+
+
+def payment_required(header: str | None, body: dict) -> dict:
+    """The 402's PaymentRequired: the PAYMENT-REQUIRED header, else the body.
+
+    x402 v2 puts the challenge in the base64 header; the body is
+    implementation-defined (pumpdata.fun sends it in both).
+    """
+    if header:
+        try:
+            return json.loads(base64.b64decode(header))
+        except ValueError:
+            pass
+    return body if isinstance(body, dict) else {}
+
+
 def pick_offer(body: dict, max_usd: float) -> dict:
-    """Choose the USDC-on-Solana `exact` offer from a 402 body.
+    """Choose the USDC-on-Solana `exact` offer from a 402's PaymentRequired.
 
     Raises:
-        ValueError: If no offer is USDC on Solana mainnet, if it names no fee
+        OfferRefusedError: If no offer is USDC on Solana mainnet, if it names no fee
             payer, or if it costs more than `max_usd`. Nothing has been signed.
     """
     for offer in body.get("accepts", []):
@@ -129,13 +147,13 @@ def pick_offer(body: dict, max_usd: float) -> dict:
         ):
             break
     else:
-        raise ValueError("402 offers no USDC payment on Solana mainnet")  # noqa: TRY003
+        raise OfferRefusedError("402 offers no USDC payment on Solana mainnet")  # noqa: TRY003
 
     if not offer.get("extra", {}).get("feePayer"):
-        raise ValueError("402 offer names no feePayer")  # noqa: TRY003
+        raise OfferRefusedError("402 offer names no feePayer")  # noqa: TRY003
     price = int(offer["amount"]) / 10**USDC_DECIMALS
     if price > max_usd:
-        raise ValueError(f"402 asks ${price}, above --max-usd ${max_usd}")  # noqa: TRY003
+        raise OfferRefusedError(f"402 asks ${price}, above --max-usd ${max_usd}")  # noqa: TRY003
     return offer
 
 
@@ -149,7 +167,7 @@ def build_payment_header(
     """
     fee_payer = Pubkey.from_string(offer["extra"]["feePayer"])
     if fee_payer == payer.pubkey():
-        raise ValueError("402 offer names this wallet as its own fee payer")  # noqa: TRY003
+        raise OfferRefusedError("402 offer names this wallet as its own fee payer")  # noqa: TRY003
     pay_to = Pubkey.from_string(offer["payTo"])
 
     transfer = transfer_checked(
@@ -230,10 +248,12 @@ async def call_pumpdata(  # noqa: PLR0913
     async with session.request(method, url, json=body) as response:
         status = response.status
         data = await read_body(response)
+        challenge = response.headers.get("PAYMENT-REQUIRED")
     if status != HTTPStatus.PAYMENT_REQUIRED:
         return Answer(status, data=data)
 
-    offer = pick_offer(data, max_usd)
+    required = payment_required(challenge, data)
+    offer = pick_offer(required, max_usd)
     price = int(offer["amount"]) / 10**USDC_DECIMALS
     if payer is None:
         return Answer(status, price_usd=price, data=data)
@@ -246,7 +266,7 @@ async def call_pumpdata(  # noqa: PLR0913
             session, rpc_endpoint, "getLatestBlockhash", [{"commitment": "confirmed"}]
         )
         blockhash = Hash.from_string(latest["value"]["blockhash"])
-    header = build_payment_header(data, offer, payer, blockhash)
+    header = build_payment_header(required, offer, payer, blockhash)
 
     async with session.request(
         method, url, json=body, headers={"PAYMENT-SIGNATURE": header}
@@ -256,7 +276,12 @@ async def call_pumpdata(  # noqa: PLR0913
         # body that follows it is not JSON.
         receipt = response.headers.get("PAYMENT-RESPONSE")
         answer = await read_body(response)
-    settled = json.loads(base64.b64decode(receipt)) if receipt else {}
+    # Past this point the payment was sent: an unreadable receipt leaves the
+    # transaction unknown, never the call unpaid.
+    try:
+        settled = json.loads(base64.b64decode(receipt)) if receipt else {}
+    except ValueError:
+        settled = {}
     return Answer(status, price, answer, settled.get("transaction"))
 
 
@@ -277,7 +302,7 @@ async def ask(  # noqa: PLR0913
     """
     try:
         return await call_pumpdata(session, api, method, path, body, **calls)
-    except ValueError as err:
+    except OfferRefusedError as err:
         print(f"\n{name}: refused, nothing signed: {err}")
         return None
 
