@@ -106,12 +106,15 @@ class Answer:
 
     `price_usd` is the offer's price, set on a 402 and on a paid answer.
     `receipt` is the settled transfer's signature, set only when this call paid.
+    `payment_unknown` is set when the paid request got no reply (status 0): the
+    payment was sent and may have settled.
     """
 
     status: int
     price_usd: float | None = None
     data: Any = None
     receipt: str | None = None
+    payment_unknown: bool = False
 
 
 class OfferRefusedError(Exception):
@@ -268,14 +271,18 @@ async def call_pumpdata(  # noqa: PLR0913
         blockhash = Hash.from_string(latest["value"]["blockhash"])
     header = build_payment_header(required, offer, payer, blockhash)
 
-    async with session.request(
-        method, url, json=body, headers={"PAYMENT-SIGNATURE": header}
-    ) as response:
-        status = response.status
-        # The receipt first: a payment that settled is reported even when the
-        # body that follows it is not JSON.
-        receipt = response.headers.get("PAYMENT-RESPONSE")
-        answer = await read_body(response)
+    try:
+        async with session.request(
+            method, url, json=body, headers={"PAYMENT-SIGNATURE": header}
+        ) as response:
+            status = response.status
+            # The receipt first: a payment that settled is reported even when the
+            # body that follows it is not JSON.
+            receipt = response.headers.get("PAYMENT-RESPONSE")
+            answer = await read_body(response)
+    except (aiohttp.ClientError, TimeoutError) as err:
+        # The signed payment went out; whether it settled is unknown. Not retried.
+        return Answer(0, price, {"error": str(err)}, payment_unknown=True)
     # Past this point the payment was sent: an unreadable receipt leaves the
     # transaction unknown, never the call unpaid.
     try:
@@ -418,6 +425,10 @@ def print_json(data: dict) -> None:
 def report(name: str, answer: Answer, *, paying: bool) -> bool:
     """Print a call's status line; True when the answer has data to print."""
     price = f"${answer.price_usd}" if answer.price_usd is not None else "-"
+    if answer.payment_unknown:
+        reason = (answer.data or {}).get("error")
+        print(f"\n{name}: no reply after paying {price}; it may have settled: {reason}")
+        return False
     if answer.status == HTTPStatus.OK:
         receipt = f", paid in {answer.receipt}" if answer.receipt else ""
         print(f"\n{name}: {price}{receipt}")
@@ -436,9 +447,19 @@ def report(name: str, answer: Answer, *, paying: bool) -> bool:
 
 def cost(answer: Answer, *, paying: bool) -> float:
     """What a call cost when paying, or would cost when not."""
-    if paying:
+    if paying:  # a payment with no reply is counted apart, in summary()
         return answer.price_usd or 0 if answer.status == HTTPStatus.OK else 0
     return answer.price_usd or 0
+
+
+def summary(answers: list[Answer], *, paying: bool) -> str:
+    """The closing line: what the calls cost, and what may have settled unseen."""
+    total = sum(cost(a, paying=paying) for a in answers)
+    line = f"{'spent' if paying else 'would cost'}: ${total:.3f}"
+    unknown = sum(a.price_usd or 0 for a in answers if a.payment_unknown)
+    if unknown:
+        line += f"; ${unknown:.3f} more may have settled (no reply after paying)"
+    return line
 
 
 async def check(  # noqa: PLR0913
@@ -457,7 +478,7 @@ async def check(  # noqa: PLR0913
     if (pay or buyers) and not RPC_ENDPOINT:
         raise SystemExit("Set SOLANA_NODE_RPC_ENDPOINT in .env, or pass --buyers 0")  # noqa: TRY003
     calls = {"rpc_endpoint": RPC_ENDPOINT, "max_usd": max_usd, "payer": payer}
-    total = 0.0
+    answers: list[Answer] = []
 
     async with aiohttp.ClientSession() as session:
         signers = []
@@ -472,7 +493,7 @@ async def check(  # noqa: PLR0913
         launch = await ask(
             session, api, name, "GET", f"/launch/{mint}", body=None, calls=calls
         )
-        total += cost(launch, paying=pay) if launch else 0
+        answers += [launch] if launch else []
         if launch and report(name, launch, paying=pay):
             print_launch(launch.data)
             creator = (launch.data.get("deployer") or {}).get("address") or creator
@@ -501,11 +522,11 @@ async def check(  # noqa: PLR0913
 
         for name, method, path, body, show in lookups:
             answer = await ask(session, api, name, method, path, body=body, calls=calls)
-            total += cost(answer, paying=pay) if answer else 0
+            answers += [answer] if answer else []
             if answer and report(name, answer, paying=pay):
                 show(answer.data)
 
-    print(f"\n{'spent' if pay else 'would cost'}: ${total:.3f}")
+    print("\n" + summary(answers, paying=pay))
 
 
 def main() -> None:

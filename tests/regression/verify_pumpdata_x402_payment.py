@@ -29,7 +29,9 @@ that holds nothing. No network, nothing signed for the chain, no funds moved:
   6. A paid call whose reply is not JSON still returns its receipt; an offer
      refused before signing is skipped by `ask`, not raised; an unreadable
      receipt after paying is a paid answer, not a refusal.
-  7. An offer carried only in the PAYMENT-REQUIRED header is read and paid.
+  7. An offer carried only in the PAYMENT-REQUIRED header is read and paid; a
+     paid request that gets no reply is reported as possibly settled, not
+     retried, and the closing line says so.
   8. The first signers come back oldest first, failed transactions skipped,
      each wallet once, the create's signer first; a curve with more history
      than the script pages through gives none.
@@ -50,6 +52,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "cookbook" / "pumpfun" / "read"))
 
+import aiohttp  # noqa: E402
 import pumpfun_check_token_pumpdata as check  # noqa: E402
 from solders.hash import Hash  # noqa: E402
 from solders.keypair import Keypair  # noqa: E402
@@ -399,7 +402,31 @@ async def check_offer_read_from_header() -> bool:
         and answer.receipt == RECEIPT
         and len(session.signatures) == 1
     )
-    return report("offer read from the PAYMENT-REQUIRED header", ok, str(answer))
+    lost = StubSession(no_reply_after_paying(offer()))
+    unknown = await call(lost, payer=Keypair())
+    line = check.summary([unknown], paying=True)
+    ok = ok and (
+        unknown.payment_unknown
+        and len(lost.signatures) == 1
+        and line
+        == "spent: $0.000; $0.005 more may have settled (no reply after paying)"
+    )
+    return report(
+        "offer read from PAYMENT-REQUIRED; no reply after paying is unknown",
+        ok,
+        f"{answer} {unknown} {line}",
+    )
+
+
+def no_reply_after_paying(accepted: dict) -> Callable[[dict], StubResponse]:
+    """402 until a payment arrives, then the connection drops."""
+
+    def answer(headers: dict) -> StubResponse:
+        if "PAYMENT-SIGNATURE" in headers:
+            raise aiohttp.ServerDisconnectedError
+        return StubResponse(402, payment_required(accepted))
+
+    return answer
 
 
 async def check_first_signers_oldest_first() -> bool:
