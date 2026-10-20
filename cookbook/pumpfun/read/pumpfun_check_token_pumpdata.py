@@ -200,6 +200,14 @@ async def rpc(
     return reply["result"]
 
 
+async def read_body(response: aiohttp.ClientResponse) -> dict:
+    """A reply's JSON body, or its first 200 characters when it is not JSON."""
+    try:
+        return await response.json(content_type=None)
+    except (json.JSONDecodeError, aiohttp.ContentTypeError):
+        return {"error": (await response.text())[:200]}
+
+
 async def call_pumpdata(  # noqa: PLR0913
     session: aiohttp.ClientSession,
     api: str,
@@ -221,7 +229,7 @@ async def call_pumpdata(  # noqa: PLR0913
     url = f"{api}{path}"
     async with session.request(method, url, json=body) as response:
         status = response.status
-        data = await response.json(content_type=None)
+        data = await read_body(response)
     if status != HTTPStatus.PAYMENT_REQUIRED:
         return Answer(status, data=data)
 
@@ -244,10 +252,34 @@ async def call_pumpdata(  # noqa: PLR0913
         method, url, json=body, headers={"PAYMENT-SIGNATURE": header}
     ) as response:
         status = response.status
-        answer = await response.json(content_type=None)
+        # The receipt first: a payment that settled is reported even when the
+        # body that follows it is not JSON.
         receipt = response.headers.get("PAYMENT-RESPONSE")
+        answer = await read_body(response)
     settled = json.loads(base64.b64decode(receipt)) if receipt else {}
     return Answer(status, price, answer, settled.get("transaction"))
+
+
+async def ask(  # noqa: PLR0913
+    session: aiohttp.ClientSession,
+    api: str,
+    name: str,
+    method: str,
+    path: str,
+    *,
+    body: dict | None,
+    calls: dict[str, Any],
+) -> Answer | None:
+    """`call_pumpdata`, or None when its offer is refused before signing.
+
+    A refused offer (above --max-usd, another asset or network) is printed and
+    skipped, so the other lookups still run and the total stays right.
+    """
+    try:
+        return await call_pumpdata(session, api, method, path, body, **calls)
+    except ValueError as err:
+        print(f"\n{name}: refused, nothing signed: {err}")
+        return None
 
 
 async def first_signers(
@@ -410,12 +442,13 @@ async def check(  # noqa: PLR0913
                 print("The curve's history is too long to reach its first buyers.")
         addresses = list(dict.fromkeys([*signers, *wallets]))[:MAX_WALLETS]
 
-        launch = await call_pumpdata(
-            session, api, "GET", f"/launch/{mint}", None, **calls
-        )
-        total += cost(launch, paying=pay)
         creator = signers[0] if signers else None
-        if report("GET /launch", launch, paying=pay):
+        name = "GET /launch"
+        launch = await ask(
+            session, api, name, "GET", f"/launch/{mint}", body=None, calls=calls
+        )
+        total += cost(launch, paying=pay) if launch else 0
+        if launch and report(name, launch, paying=pay):
             print_launch(launch.data)
             creator = (launch.data.get("deployer") or {}).get("address") or creator
 
@@ -442,9 +475,9 @@ async def check(  # noqa: PLR0913
             )
 
         for name, method, path, body, show in lookups:
-            answer = await call_pumpdata(session, api, method, path, body, **calls)
-            total += cost(answer, paying=pay)
-            if report(name, answer, paying=pay):
+            answer = await ask(session, api, name, method, path, body=body, calls=calls)
+            total += cost(answer, paying=pay) if answer else 0
+            if answer and report(name, answer, paying=pay):
                 show(answer.data)
 
     print(f"\n{'spent' if pay else 'would cost'}: ${total:.3f}")

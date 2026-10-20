@@ -26,7 +26,9 @@ that holds nothing. No network, nothing signed for the chain, no funds moved:
   4. Offers above the cap, in another asset, on another network, without a
      fee payer, or naming the payer as fee payer are refused before signing.
   5. A 404 costs nothing; an unpaid 402 is counted as what it would cost.
-  6. The first signers come back oldest first, failed transactions skipped,
+  6. A paid call whose reply is not JSON still returns its receipt; an offer
+     refused before signing is skipped by `ask`, not raised.
+  7. The first signers come back oldest first, failed transactions skipped,
      each wallet once, the create's signer first; a curve with more history
      than the script pages through gives none.
 
@@ -102,7 +104,9 @@ def payment_required(accepted: dict) -> dict:
 class StubResponse:
     """Minimal stand-in for an aiohttp response."""
 
-    def __init__(self, status: int, payload: dict, headers: dict | None = None) -> None:
+    def __init__(
+        self, status: int, payload: dict | str, headers: dict | None = None
+    ) -> None:
         self.status = status
         self.headers = headers or {}
         self._payload = payload
@@ -114,8 +118,18 @@ class StubResponse:
         return False
 
     async def json(self, content_type: str | None = None) -> dict:  # noqa: ARG002
-        """Return the scripted payload."""
+        """Return the scripted payload; a string payload is not JSON."""
+        if isinstance(self._payload, str):
+            return json.loads(self._payload)  # raises, as a page would
         return self._payload
+
+    async def text(self) -> str:
+        """Return the payload as text."""
+        return (
+            self._payload
+            if isinstance(self._payload, str)
+            else json.dumps(self._payload)
+        )
 
 
 class StubSession:
@@ -316,6 +330,29 @@ async def check_costs() -> bool:
     return report("only answered calls count as spent", ok)
 
 
+async def check_bad_replies_do_not_lose_the_payment() -> bool:
+    """A non-JSON reply after paying keeps the receipt; a refused offer is skipped."""
+    paid = paid_once(offer())
+
+    def gateway_page(headers: dict) -> StubResponse:
+        answer = paid(headers)
+        if "PAYMENT-SIGNATURE" in headers:
+            return StubResponse(502, "<html>Bad Gateway</html>", answer.headers)
+        return answer
+
+    answer = await call(StubSession(gateway_page), payer=Keypair())
+    kept = answer.receipt == RECEIPT and "Bad Gateway" in answer.data["error"]
+    session = StubSession(paid_once(offer(amount="20000")))
+    calls = {"payer": Keypair(), "rpc_endpoint": RPC, "max_usd": 0.01}
+    skipped = await check.ask(session, API, "GET", "GET", PATH, body=None, calls=calls)
+    ok = kept and skipped is None and not session.signatures
+    return report(
+        "non-JSON reply keeps the receipt; refused offer skipped",
+        ok,
+        f"{answer} {skipped}",
+    )
+
+
 async def check_first_signers_oldest_first() -> bool:
     """The first signers are read oldest first, skipping failures and repeats."""
     # Newest first, as getSignaturesForAddress returns them.
@@ -369,6 +406,7 @@ async def main() -> None:
         await check_refused_payment_not_retried(),
         await check_bad_offers_refused_before_signing(),
         await check_costs(),
+        await check_bad_replies_do_not_lose_the_payment(),
         await check_first_signers_oldest_first(),
     ]
 
