@@ -317,7 +317,10 @@ def print_launch(launch: dict) -> None:
     print(f"deployer:            {deployer.get('address')}")
     print(f"  launches:          {deployer.get('launches')}")
     print(f"  graduations:       {deployer.get('graduations')}")
-    print(f"  best peak:         {deployer.get('best_peak')}x")
+    best_peak = deployer.get("best_peak")
+    print(
+        f"  best peak:         {f'{best_peak}x' if best_peak is not None else 'none on record'}"
+    )
     print(
         f"bundle at creation:  {bundle.get('buyers_first_10s')} buyers in the first 10 s"
     )
