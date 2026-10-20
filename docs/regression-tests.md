@@ -47,6 +47,7 @@ individual scripts for a subset.
 | `verify_launchlab_trades.py` | against real StonkFun trades, the LaunchLab curve math reproduces each buy and sell to the unit — fee rate read from the configs, transfer fee from the mint; price comes from virtual plus real reserves; the swap names the on-chain 18 accounts with fee vaults keyed by the pool's quote mint; an exact-in buy gets the configured amount unpadded; buy and sell floors are net of curve fee and transfer fee; single-token mode waits past a coin its filters refuse instead of exiting on it |
 | `verify_launchlab_launch_parsing.py` | legacy, v0 and v1 StonkFun launches parse from every account slot over blockSubscribe and geyser alike, lookup-table accounts included; the creator slot wins over the payer; a router-issued launch is found; letsbonk and StonkFun each keep to their own platform configs; LaunchLab listeners subscribe on platform configs, pump.fun on its program |
 | `verify_cleanup_harvests_withheld_fees.py` | cleanup harvests withheld Token-2022 transfer fees into the mint before closing a token account, and sends a bare close when nothing is withheld |
+| `verify_pumpdata_x402_payment.py` | the pumpdata lookup signs nothing without `--pay`, pays a refused payment once only, refuses an offer above the cap or outside USDC on mainnet before signing, signs the transfer as authority only with the offer's `feePayer` left to the facilitator, and reads a curve's first signers oldest first |
 
 Two mainnet simulations, also no funds moved:
 
