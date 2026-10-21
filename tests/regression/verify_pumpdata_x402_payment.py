@@ -29,10 +29,10 @@ that holds nothing. No network, nothing signed for the chain, no funds moved:
   6. A paid call whose reply is not JSON still returns its receipt; an offer
      refused before signing is skipped by `ask`, not raised; an unreadable
      receipt after paying is a paid answer, not a refusal.
-  7. An offer carried only in the PAYMENT-REQUIRED header is read and paid; a
-     paid request that gets no reply is reported as possibly settled, not
+  7. An offer carried only in the PAYMENT-REQUIRED header is read and paid.
+  8. A paid request that gets no reply is reported as possibly settled, not
      retried, and the closing line says so.
-  8. The first signers come back oldest first, failed transactions skipped,
+  9. The first signers come back oldest first, failed transactions skipped,
      each wallet once, the create's signer first; a curve with more history
      than the script pages through gives none.
 
@@ -402,19 +402,24 @@ async def check_offer_read_from_header() -> bool:
         and answer.receipt == RECEIPT
         and len(session.signatures) == 1
     )
+    return report("offer read from the PAYMENT-REQUIRED header", ok, str(answer))
+
+
+async def check_no_reply_after_paying() -> bool:
+    """A paid request with no reply is possibly settled: flagged, not retried."""
     lost = StubSession(no_reply_after_paying(offer()))
     unknown = await call(lost, payer=Keypair())
     line = check.summary([unknown], paying=True)
-    ok = ok and (
+    ok = (
         unknown.payment_unknown
         and len(lost.signatures) == 1
         and line
         == "spent: $0.000; $0.005 more may have settled (no reply after paying)"
     )
     return report(
-        "offer read from PAYMENT-REQUIRED; no reply after paying is unknown",
+        "no reply after paying is reported as possibly settled",
         ok,
-        f"{answer} {unknown} {line}",
+        f"{unknown} {line}",
     )
 
 
@@ -484,6 +489,7 @@ async def main() -> None:
         await check_costs(),
         await check_bad_replies_do_not_lose_the_payment(),
         await check_offer_read_from_header(),
+        await check_no_reply_after_paying(),
         await check_first_signers_oldest_first(),
     ]
 
