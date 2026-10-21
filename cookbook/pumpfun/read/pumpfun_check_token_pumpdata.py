@@ -129,9 +129,11 @@ def payment_required(header: str | None, body: dict) -> dict:
     """
     if header:
         try:
-            return json.loads(base64.b64decode(header))
+            decoded = json.loads(base64.b64decode(header))
         except ValueError:
-            pass
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded
     return body if isinstance(body, dict) else {}
 
 
@@ -140,11 +142,16 @@ def pick_offer(body: dict, max_usd: float) -> dict:
 
     Raises:
         OfferRefusedError: If no offer is USDC on Solana mainnet, if it names no fee
-            payer, or if it costs more than `max_usd`. Nothing has been signed.
+            payer, if its amount, payTo or feePayer do not parse, or if it costs
+            more than `max_usd`. Nothing has been signed.
     """
-    for offer in body.get("accepts", []):
+    accepts = body.get("accepts") if isinstance(body, dict) else None
+    if not isinstance(accepts, list):
+        raise OfferRefusedError("402 carries no list of offers")  # noqa: TRY003
+    for offer in accepts:
         if (
-            offer.get("scheme") == "exact"
+            isinstance(offer, dict)
+            and offer.get("scheme") == "exact"
             and offer.get("network") == SOLANA_MAINNET
             and offer.get("asset") == str(USDC_MINT)
         ):
@@ -152,9 +159,19 @@ def pick_offer(body: dict, max_usd: float) -> dict:
     else:
         raise OfferRefusedError("402 offers no USDC payment on Solana mainnet")  # noqa: TRY003
 
-    if not offer.get("extra", {}).get("feePayer"):
+    extra = offer.get("extra")
+    if not isinstance(extra, dict) or not extra.get("feePayer"):
         raise OfferRefusedError("402 offer names no feePayer")  # noqa: TRY003
-    price = int(offer["amount"]) / 10**USDC_DECIMALS
+    # everything the signing reads, checked here, so a bad value is a refusal
+    try:
+        amount = int(offer["amount"])
+        Pubkey.from_string(str(offer["payTo"]))
+        Pubkey.from_string(str(extra["feePayer"]))
+    except (KeyError, TypeError, ValueError) as err:
+        raise OfferRefusedError(f"402 offer does not parse ({err})") from err  # noqa: TRY003
+    if amount <= 0:
+        raise OfferRefusedError(f"402 offer asks a non-positive amount ({amount})")  # noqa: TRY003
+    price = amount / 10**USDC_DECIMALS
     if price > max_usd:
         raise OfferRefusedError(f"402 asks ${price}, above --max-usd ${max_usd}")  # noqa: TRY003
     return offer
@@ -314,6 +331,19 @@ async def ask(  # noqa: PLR0913
         return None
 
 
+def wallet_set(
+    signers: list[str], wallets: list[str], deployer: str | None, *, buyers: int
+) -> list[str]:
+    """The wallets for POST /wallets: the curve's first signers, then --wallet.
+
+    When buyers were asked for but the curve's history was too long to read them,
+    the deployer from /launch takes the place of the first signer. With
+    `--buyers 0` it is not added: that run asked for no wallet lookup of its own.
+    """
+    first = signers or ([deployer] if buyers and deployer else [])
+    return list(dict.fromkeys([*first, *wallets]))[:MAX_WALLETS]
+
+
 async def first_signers(
     session: aiohttp.ClientSession, rpc_endpoint: str, mint: Pubkey, count: int
 ) -> list[str]:
@@ -327,19 +357,23 @@ async def first_signers(
     )
     signatures: list[dict] = []
     before = None
-    for _ in range(MAX_SIGNATURE_PAGES):
+    # one page past the bound tells exactly MAX_SIGNATURE_PAGES full pages (the
+    # whole history) from more (too long): an empty extra page is the former
+    for page_number in range(MAX_SIGNATURE_PAGES + 1):
         options: dict[str, Any] = {"limit": SIGNATURE_PAGE, "commitment": "confirmed"}
         if before:
             options["before"] = before
         page = await rpc(
             session, rpc_endpoint, "getSignaturesForAddress", [str(curve), options]
         )
+        if page_number == MAX_SIGNATURE_PAGES:
+            if page:
+                return []
+            break
         signatures += page
         if len(page) < SIGNATURE_PAGE:
             break
         before = page[-1]["signature"]
-    else:
-        return []
 
     oldest = [s["signature"] for s in reversed(signatures) if s.get("err") is None]
     signers: list[str] = []
@@ -433,6 +467,12 @@ def report(name: str, answer: Answer, *, paying: bool) -> bool:
         receipt = f", paid in {answer.receipt}" if answer.receipt else ""
         print(f"\n{name}: {price}{receipt}")
         return True
+    if answer.receipt:
+        # settled (the receipt names the transfer), but the answer is not a 200
+        print(
+            f"\n{name}: {price}, paid in {answer.receipt}, but HTTP {answer.status}: {answer.data}"
+        )
+        return False
     if answer.status == HTTPStatus.PAYMENT_REQUIRED and not paying:
         print(f"{name}: {price} (not paid; run with --pay)")
     elif answer.status == HTTPStatus.PAYMENT_REQUIRED:
@@ -448,7 +488,8 @@ def report(name: str, answer: Answer, *, paying: bool) -> bool:
 def cost(answer: Answer, *, paying: bool) -> float:
     """What a call cost when paying, or would cost when not."""
     if paying:  # a payment with no reply is counted apart, in summary()
-        return answer.price_usd or 0 if answer.status == HTTPStatus.OK else 0
+        settled = answer.status == HTTPStatus.OK or bool(answer.receipt)
+        return answer.price_usd or 0 if settled else 0
     return answer.price_usd or 0
 
 
@@ -486,8 +527,6 @@ async def check(  # noqa: PLR0913
             signers = await first_signers(session, RPC_ENDPOINT, mint, buyers)
             if not signers:
                 print("The curve's history is too long to reach its first buyers.")
-        addresses = list(dict.fromkeys([*signers, *wallets]))[:MAX_WALLETS]
-
         creator = signers[0] if signers else None
         name = "GET /launch"
         launch = await ask(
@@ -497,6 +536,7 @@ async def check(  # noqa: PLR0913
         if launch and report(name, launch, paying=pay):
             print_launch(launch.data)
             creator = (launch.data.get("deployer") or {}).get("address") or creator
+        addresses = wallet_set(signers, wallets, creator, buyers=buyers)
 
         # Each optional call: (shown as, method, path, body, how to print it).
         lookups = []

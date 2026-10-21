@@ -32,7 +32,17 @@ that holds nothing. No network, nothing signed for the chain, no funds moved:
   7. An offer carried only in the PAYMENT-REQUIRED header is read and paid.
   8. A paid request that gets no reply is reported as possibly settled, not
      retried, and the closing line says so.
-  9. The first signers come back oldest first, failed transactions skipped,
+  9. A malformed offer (no list of offers, a null offer, extra not an object, an
+     amount, payTo or feePayer that does not parse, a zero amount) is refused
+     before anything is signed.
+  10. A paid answer that is not a 200 but carries a receipt naming the transfer
+      is counted as spent.
+  11. Exactly MAX_SIGNATURE_PAGES full pages of curve history is the whole
+      history (the first signers come back), not "too long".
+  12. The wallets for POST /wallets: the first signers and --wallet; the
+      deployer from /launch when buyers were asked for and could not be read;
+      never added with --buyers 0.
+  13. The first signers come back oldest first, failed transactions skipped,
      each wallet once, the create's signer first; a curve with more history
      than the script pages through gives none.
 
@@ -434,6 +444,115 @@ def no_reply_after_paying(accepted: dict) -> Callable[[dict], StubResponse]:
     return answer
 
 
+async def check_malformed_offers_refused() -> bool:
+    """Offers that do not parse are refusals, raised before signing."""
+    good = offer()
+    cases = {
+        "no list of offers": {"x402Version": 2, "accepts": "x"},
+        "a null offer": {"x402Version": 2, "accepts": [None]},
+        "extra not an object": payment_required(offer(extra=["x"])),
+        "amount not a number": payment_required(offer(amount="abc")),
+        "zero amount": payment_required(offer(amount="0")),
+        "payTo not an address": payment_required(offer(payTo="not-a-key")),
+        "feePayer not an address": payment_required(offer(extra={"feePayer": "bad"})),
+    }
+    failures = []
+    for name, body in cases.items():
+        session = StubSession(lambda _h, body=body: StubResponse(402, body))
+        try:
+            await call(session, payer=Keypair())
+            failures.append(f"{name}: paid")
+        except check.OfferRefusedError:
+            if session.signatures:
+                failures.append(f"{name}: signed before refusing")
+        except Exception as err:  # noqa: BLE001
+            failures.append(f"{name}: {type(err).__name__}")
+    # the good offer still goes through
+    ok_session = StubSession(paid_once(good))
+    answer = await call(ok_session, payer=Keypair())
+    if answer.status != HTTPStatus.OK:
+        failures.append(f"a good offer: {answer}")
+    return report(
+        "malformed offers refused before signing", not failures, "; ".join(failures)
+    )
+
+
+async def check_receipt_on_error_counts() -> bool:
+    """A non-200 paid answer whose receipt names the transfer counts as spent."""
+    paid = paid_once(offer())
+
+    def settled_then_500(headers: dict) -> StubResponse:
+        answer = paid(headers)
+        if "PAYMENT-SIGNATURE" in headers:
+            return StubResponse(500, {"error": "internal"}, answer.headers)
+        return answer
+
+    answer = await call(StubSession(settled_then_500), payer=Keypair())
+    line = check.summary([answer], paying=True)
+    ok = (
+        answer.status == HTTPStatus.INTERNAL_SERVER_ERROR
+        and answer.receipt == RECEIPT
+        and line == "spent: $0.005"
+    )
+    return report(
+        "a receipt on a non-200 answer counts as spent", ok, f"{answer} {line}"
+    )
+
+
+async def check_page_boundary() -> bool:
+    """Five full pages and an empty sixth is the whole history; a sixth with rows is not."""
+    pages = check.MAX_SIGNATURE_PAGES
+    size = check.SIGNATURE_PAGE
+
+    def history(extra: int) -> Callable[[str, list], object]:
+        calls = {"n": 0}
+
+        def rpc(method: str, params: list) -> object:
+            if method == "getSignaturesForAddress":
+                n = calls["n"]
+                calls["n"] += 1
+                if (
+                    n < pages
+                ):  # newest first: page 0 has the newest, the last full page ends with the create
+                    return [
+                        {"signature": f"p{n}-{i}", "err": None} for i in range(size)
+                    ]
+                return [{"signature": f"x{i}", "err": None} for i in range(extra)]
+            return {"transaction": {"message": {"accountKeys": [params[0]]}}}
+
+        return rpc
+
+    mint = Keypair().pubkey()
+    whole = await check.first_signers(
+        StubSession(paid_once(offer()), history(0)), RPC, mint, 1
+    )
+    longer = await check.first_signers(
+        StubSession(paid_once(offer()), history(3)), RPC, mint, 1
+    )
+    oldest = f"p{pages - 1}-{size - 1}"
+    second = f"p{pages - 1}-{size - 2}"
+    ok = whole == [oldest, second] and longer == []
+    return report(
+        "five full pages is the whole history; more gives none", ok, f"{whole} {longer}"
+    )
+
+
+async def check_wallet_set() -> bool:
+    """The /wallets set: signers and --wallet; the deployer only when buyers were not read."""
+    ws = check.wallet_set
+    ok = (
+        ws(["d", "b1"], ["w"], "d", buyers=10) == ["d", "b1", "w"]
+        and ws([], ["w"], "d", buyers=10) == ["d", "w"]
+        and ws([], ["w"], "d", buyers=0) == ["w"]
+        and ws([], [], "d", buyers=0) == []
+        and ws([], [], None, buyers=10) == []
+        and ws(["d"], ["d"], "d", buyers=10) == ["d"]
+    )
+    return report(
+        "the /wallets set adds the deployer only when buyers were not read", ok
+    )
+
+
 async def check_first_signers_oldest_first() -> bool:
     """The first signers are read oldest first, skipping failures and repeats."""
     # Newest first, as getSignaturesForAddress returns them.
@@ -490,6 +609,10 @@ async def main() -> None:
         await check_bad_replies_do_not_lose_the_payment(),
         await check_offer_read_from_header(),
         await check_no_reply_after_paying(),
+        await check_malformed_offers_refused(),
+        await check_receipt_on_error_counts(),
+        await check_page_boundary(),
+        await check_wallet_set(),
         await check_first_signers_oldest_first(),
     ]
 
